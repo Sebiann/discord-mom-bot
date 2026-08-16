@@ -31,6 +31,29 @@ const client = new Client({
 
 let totalSum = 0;
 let lastTopicValue = null;
+let topicUpdateInFlight = false;
+let pendingTopicValue = null;
+
+function timestamp() {
+  return new Date().toISOString();
+}
+
+function log(message) {
+  console.log(`[${timestamp()}] ${message}`);
+}
+
+function logError(message, err) {
+  if (err) {
+    console.error(`[${timestamp()}] ${message}`, err);
+    return;
+  }
+
+  console.error(`[${timestamp()}] ${message}`);
+}
+
+function buildTopicText(value) {
+  return `Total amount: ${value} | Updated: ${timestamp()}`;
+}
 
 async function fetchCurrencySum() {
   try {
@@ -61,39 +84,56 @@ async function fetchCurrencySum() {
     }
 
     totalSum = sum;
-    console.log(`Total sum calculated: ${totalSum}`);
-    updateEverything();
+    log(`Total sum calculated: ${totalSum}`);
+    await updateEverything();
   } catch (err) {
-    console.error('Error fetching messages:', err);
+    logError('Error fetching messages:', err);
   }
 }
 
 async function updateChannelTopic(newValue) {
+  pendingTopicValue = newValue;
+
+  if (topicUpdateInFlight) {
+    return;
+  }
+
+  topicUpdateInFlight = true;
+
   try {
-    // Only update if the number changed — prevents audit log spam
-    if (newValue === lastTopicValue) {
-      console.log(`Topic unchanged (${newValue}), skipping update`);
-      return;
+    while (pendingTopicValue !== null) {
+      const nextValue = pendingTopicValue;
+      pendingTopicValue = null;
+
+      // Only update if the number changed - prevents audit log spam
+      if (nextValue === lastTopicValue) {
+        log(`Topic unchanged (${nextValue}), skipping update`);
+        continue;
+      }
+
+      const channel = await client.channels.fetch(CHANNEL_ID);
+      if (!channel || !channel.isTextBased()) {
+        logError('Cannot update topic - not a text channel');
+        return;
+      }
+
+      const topicText = buildTopicText(nextValue);
+
+      await channel.edit({
+        topic: topicText
+      });
+
+      lastTopicValue = nextValue;
+      log(`Channel topic updated to: ${topicText}`);
     }
-
-    const channel = await client.channels.fetch(CHANNEL_ID);
-    if (!channel || !channel.isTextBased()) {
-      console.error('Cannot update topic — not a text channel');
-      return;
-    }
-
-    await channel.edit({ 
-      topic: `Total amount: ${newValue}` 
-    });
-
-    lastTopicValue = newValue;
-    console.log(`Channel topic updated to: Total amount: ${newValue}`);
   } catch (err) {
-    console.error('Error updating topic:', err.message);
+    logError('Error updating topic:', err.message);
+  } finally {
+    topicUpdateInFlight = false;
   }
 }
 
-function updateEverything() {
+async function updateEverything() {
   client.user.setPresence({
     status: 'online',
     activities: [{
@@ -101,14 +141,14 @@ function updateEverything() {
       type: ActivityType.Watching
     }]
   });
-  console.log(`Status updated → Total number: ${totalSum}`);
+  log(`Status updated -> Total number: ${totalSum}`);
 
   // Also update channel topic (only if changed)
-  updateChannelTopic(totalSum);
+  await updateChannelTopic(totalSum);
 }
 
 client.on('clientReady', async () => {
-  console.log(`✅ ${client.user.tag} logged in`);
+  log(`${client.user.tag} logged in`);
   await fetchCurrencySum();
 
   // Recount every 30 minutes as a safety net
@@ -117,28 +157,32 @@ client.on('clientReady', async () => {
 
 client.on('messageCreate', (message) => {
   if (message.channelId === CHANNEL_ID && !message.author.bot) {
-    const added = sumCurrencyValues(message.content);
-    if (added > 0) {
-      totalSum += added;
-      updateEverything();
-      console.log(`Added ${added}, new total: ${totalSum}`);
-    }
+    (async () => {
+      const added = sumCurrencyValues(message.content);
+      if (added > 0) {
+        totalSum += added;
+        await updateEverything();
+        log(`Added ${added}, new total: ${totalSum}`);
+      }
+    })().catch(err => logError('Error handling messageCreate:', err));
   }
 });
 
 client.on('messageDelete', (message) => {
   if (message.channelId === CHANNEL_ID) {
-    const removed = sumCurrencyValues(message.content || '');
-    if (removed > 0) {
-      totalSum -= removed;
-      updateEverything();
-      console.log(`Removed ${removed}, new total: ${totalSum}`);
-    }
+    (async () => {
+      const removed = sumCurrencyValues(message.content || '');
+      if (removed > 0) {
+        totalSum -= removed;
+        await updateEverything();
+        log(`Removed ${removed}, new total: ${totalSum}`);
+      }
+    })().catch(err => logError('Error handling messageDelete:', err));
   }
 });
 
 process.on('unhandledRejection', (err) => {
-  console.error('Unhandled:', err);
+  logError('Unhandled:', err);
 });
 
 client.login(TOKEN);
